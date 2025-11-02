@@ -179,6 +179,21 @@ class CharbonnierLoss(nn.Module):
         loss = torch.mean(torch.sqrt((diff * diff) + (self.eps*self.eps)))
         return loss
 
+class WeightedLoss(nn.Module):
+    """Weighted Loss for multiple loss components"""
+    def __init__(self, num_weights):
+        super(WeightedLoss, self).__init__()
+        self.num_weights = num_weights
+        self.weights = nn.Parameter(torch.rand(1, num_weights))
+        self.softmax_l = nn.Softmax(dim=1)
+
+    def forward(self, *argv):
+        loss = 0
+        weights = self.softmax_l(self.weights)
+        for idx, arg in enumerate(argv):
+            loss += arg * weights[0, idx]
+        return loss
+
 class GradientLoss(nn.Module):
     def __init__(self):
         super(GradientLoss, self).__init__()
@@ -211,6 +226,10 @@ Charbonnier_loss = CharbonnierLoss().to(device)
 Gradient_Loss = GradientLoss().to(device)
 L_per = VGGPerceptualLoss().to(device)
 MS_SSIM_loss = MS_SSIM(win_size=11, win_sigma=1.5, data_range=1, size_average=True, channel=3).to(device)
+
+# 添加動態權重損失（參考 train.py）
+Weighted_Loss4 = WeightedLoss(4).to(device)  # 4個損失組件
+Weighted_Loss2 = WeightedLoss(2).to(device)  # 低解析度和高解析度損失
 
 
 def get_scheduler(optimizer, opt):
@@ -256,34 +275,44 @@ for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
     for iteration, batch in enumerate(progress_bar, 1):
         # 前向傳播
         rgb, tar, indx = batch[0].to(device), batch[1].to(device), batch[2]
-        output = net_g(rgb)
         
-        # 處理模型輸出 - Restormer返回兩個輸出
-        if isinstance(output, tuple):
-            fake_b = output[0]  # 使用第一個輸出作為主要輸出
-        else:
-            fake_b = output
+        # Restormer 返回兩個輸出：低解析度 (256x256) 和高解析度 (512x512)
+        fake_b_L, fake_b_H = net_g(rgb)
+        
+        # 對高解析度輸出，需要上採樣目標圖像以匹配
+        tar_H = F.interpolate(tar, scale_factor=2, mode='bilinear', align_corners=False)
 
         ######################
         # 更新生成器
         ######################
         optimizer_g.zero_grad()
       
-        # 計算損失（使用Spectroformer原始損失權重）
-        loss_g_l1 = (0.03 * Charbonnier_loss(tar, fake_b) +
-                      0.025 * L_per(fake_b, tar) +
-                      0.02 * Gradient_Loss(fake_b, tar) +
-                      0.01 * (1 - MS_SSIM_loss(fake_b, tar)))
-
-        loss_g = loss_g_l1
+        # 計算低解析度損失（參考 train.py 的方式）
+        loss_L_char = Charbonnier_loss(tar, fake_b_L)
+        loss_L_per = L_per(fake_b_L, tar)
+        loss_L_grad = Gradient_Loss(fake_b_L, tar)
+        loss_L_ssim = 1 - MS_SSIM_loss(fake_b_L, tar)
+        loss_g_L = Weighted_Loss4(loss_L_char, loss_L_per, loss_L_grad, loss_L_ssim)
+        
+        # 計算高解析度損失
+        loss_H_char = Charbonnier_loss(tar_H, fake_b_H)
+        loss_H_per = L_per(fake_b_H, tar_H)
+        loss_H_grad = Gradient_Loss(fake_b_H, tar_H)
+        loss_H_ssim = 1 - MS_SSIM_loss(fake_b_H, tar_H)
+        loss_g_H = Weighted_Loss4(loss_H_char, loss_H_per, loss_H_grad, loss_H_ssim)
+        
+        # 組合兩個損失（使用動態權重）
+        loss_g = Weighted_Loss2(loss_g_L, loss_g_H)
         
         # 檢查損失是否為nan或inf
         if torch.isnan(loss_g) or torch.isinf(loss_g):
             print(f"警告：在epoch {epoch}, iteration {iteration} 檢測到異常損失: {loss_g.item()}")
-            print(f"L1損失: {0.03 * Charbonnier_loss(tar, fake_b):.6f}")
-            print(f"感知損失: {0.025 * L_per(fake_b, tar):.6f}")
-            print(f"梯度損失: {0.02 * Gradient_Loss(fake_b, tar):.6f}")
-            print(f"MS-SSIM損失: {0.01 * (1 - MS_SSIM_loss(fake_b, tar)):.6f}")
+            print(f"低解析度損失: {loss_g_L.item():.6f}")
+            print(f"高解析度損失: {loss_g_H.item():.6f}")
+            print(f"  - Charbonnier損失 (L): {loss_L_char.item():.6f}, (H): {loss_H_char.item():.6f}")
+            print(f"  - 感知損失 (L): {loss_L_per.item():.6f}, (H): {loss_H_per.item():.6f}")
+            print(f"  - 梯度損失 (L): {loss_L_grad.item():.6f}, (H): {loss_H_grad.item():.6f}")
+            print(f"  - MS-SSIM損失 (L): {loss_L_ssim.item():.6f}, (H): {loss_H_ssim.item():.6f}")
             
             # 跳過這個batch的更新
             optimizer_g.zero_grad()
@@ -309,7 +338,8 @@ for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
         })
 
         if iteration % 20 == 0:
-            out_image = torch.cat((rgb, fake_b, tar), 3)
+            # 使用低解析度輸出進行可視化
+            out_image = torch.cat((rgb, fake_b_L, tar), 3)
             out_image = out_image[0].detach().squeeze(0).cpu()
             save_img(out_image, os.path.join(opt.output_dir, indx[0]))
         
@@ -344,12 +374,9 @@ for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
     for test_iter, batch in enumerate(test_progress, 1):
         rgb_input, target, ind = batch[0].to(device), batch[1].to(device), batch[2]
         with torch.no_grad():
-            output = net_g(rgb_input)
-            # 處理模型輸出 - Restormer返回兩個輸出
-            if isinstance(output, tuple):
-                prediction = output[0]  # 使用第一個輸出作為主要輸出
-            else:
-                prediction = output
+            # Restormer 返回兩個輸出，使用低解析度輸出進行評估
+            prediction_L, prediction_H = net_g(rgb_input)
+            prediction = prediction_L  # 使用低解析度輸出與原始目標比較
         
         out = torch.cat((prediction, target), 3)
         output_cat = out[0].detach().squeeze(0).cpu()
