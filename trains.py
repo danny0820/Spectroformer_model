@@ -256,7 +256,13 @@ for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
     for iteration, batch in enumerate(progress_bar, 1):
         # 前向傳播
         rgb, tar, indx = batch[0].to(device), batch[1].to(device), batch[2]
-        fake_b = net_g(rgb)
+        output = net_g(rgb)
+        
+        # 處理模型輸出 - Restormer返回兩個輸出
+        if isinstance(output, tuple):
+            fake_b = output[0]  # 使用第一個輸出作為主要輸出
+        else:
+            fake_b = output
 
         ######################
         # 更新生成器
@@ -338,7 +344,12 @@ for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
     for test_iter, batch in enumerate(test_progress, 1):
         rgb_input, target, ind = batch[0].to(device), batch[1].to(device), batch[2]
         with torch.no_grad():
-            prediction = net_g(rgb_input)
+            output = net_g(rgb_input)
+            # 處理模型輸出 - Restormer返回兩個輸出
+            if isinstance(output, tuple):
+                prediction = output[0]  # 使用第一個輸出作為主要輸出
+            else:
+                prediction = output
         
         out = torch.cat((prediction, target), 3)
         output_cat = out[0].detach().squeeze(0).cpu()
