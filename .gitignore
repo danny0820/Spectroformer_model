@@ -52,5 +52,5 @@ LSUI_test/
 checkpoint/
 v1ckp/
 
-Spectroformer_model/eval "$(ssh-agent -s)"
-Spectroformer_model/eval "$(ssh-agent -s)".pub
+.eval "$(ssh-agent -s)"
+.eval "$(ssh-agent -s)".pub
