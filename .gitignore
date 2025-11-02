@@ -1,0 +1,56 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+env/
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
+
+# Installer logs
+env.log
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# Environments
+.env
+.venv
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Images
+images/
+test/
+LSUI/
+LSUI_test/
+
+# Checkpoints
+checkpoint/
+v1ckp/
+
+Spectroformer_model/eval "$(ssh-agent -s)"
+Spectroformer_model/eval "$(ssh-agent -s)".pub
