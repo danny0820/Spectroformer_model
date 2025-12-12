@@ -2,6 +2,7 @@
 from __future__ import print_function
 import argparse
 import os
+from datetime import datetime
 from torchvision import transforms
 import torch
 import torch.nn as nn
@@ -13,18 +14,22 @@ from tqdm import tqdm
 import torch.nn.functional as F
 from pytorch_msssim import MS_SSIM
 # from final_model_AGSSF1 import mymodel 
+from spectroformer_paper import mymodel
 # from model_without_CA import mymodel
-from phaseformer import Restormer
+# from phaseformer import Restormer
 import torch.backends.cudnn as cudnn
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
+
+# 生成訓練運行的唯一標識符（時間戳）
+RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 # 解析命令列參數
 parser = argparse.ArgumentParser(description='Spectroformer 訓練腳本')
 # --- 資料集與批次大小 ---
 parser.add_argument('--dataset_path', default='/danny/Spectroformer_model/LSUI', help='LSUI 資料集的路徑')
-parser.add_argument('--batch_size', type=int, default=8, help='訓練批次大小')
-parser.add_argument('--test_batch_size', type=int, default=8, help='測試批次大小')
+parser.add_argument('--batch_size', type=int, default=4, help='訓練批次大小')
+parser.add_argument('--test_batch_size', type=int, default=4, help='測試批次大小')
 parser.add_argument('--threads', type=int, default=0, help='資料載入器使用的執行緒數量')
 
 # --- 訓練週期與學習率 ---
@@ -47,7 +52,7 @@ opt = parser.parse_args()
 
 print(opt)
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 if opt.cuda and not torch.cuda.is_available():
     raise Exception("未找到 GPU，請在沒有 --cuda 的情況下執行")
 
@@ -59,7 +64,7 @@ if opt.cuda:
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"使用裝置: {device}")
 
-net_g = Restormer()
+net_g = mymodel()
 net_g = net_g.to(device)
 
 # 多卡訓練設置
@@ -229,7 +234,6 @@ MS_SSIM_loss = MS_SSIM(win_size=11, win_sigma=1.5, data_range=1, size_average=Tr
 
 # 添加動態權重損失（參考 train.py）
 Weighted_Loss4 = WeightedLoss(4).to(device)  # 4個損失組件
-Weighted_Loss2 = WeightedLoss(2).to(device)  # 低解析度和高解析度損失
 
 
 def get_scheduler(optimizer, opt):
@@ -259,9 +263,24 @@ def save_img(img_tensor, filename):
         img = transforms.ToPILImage()(img_tensor.clamp(0, 1))
         img.save(filename)
 
-# 創建輸出目錄
-os.makedirs(opt.output_dir, exist_ok=True)
+# 創建帶時間戳的輸出目錄（每次訓練獨立）
+train_output_dir = os.path.join(opt.output_dir, f'train_{RUN_TIMESTAMP}')
+test_output_dir = os.path.join('./test', f'test_{RUN_TIMESTAMP}')
+checkpoint_dir = os.path.join('checkpoint', opt.dataset_path.split('/')[-1], f'run_{RUN_TIMESTAMP}')
 
+os.makedirs(train_output_dir, exist_ok=True)
+os.makedirs(test_output_dir, exist_ok=True)
+os.makedirs(checkpoint_dir, exist_ok=True)
+
+print(f"\n=== 訓練運行: {RUN_TIMESTAMP} ===")
+print(f"訓練圖片輸出目錄: {train_output_dir}")
+print(f"測試圖片輸出目錄: {test_output_dir}")
+print(f"模型檢查點目錄: {checkpoint_dir}")
+print("=" * 50)
+
+# 追蹤最佳模型
+best_psnr = 0.0
+best_epoch = 0
 
 for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
     # 訓練
@@ -276,43 +295,28 @@ for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
         # 前向傳播
         rgb, tar, indx = batch[0].to(device), batch[1].to(device), batch[2]
         
-        # Restormer 返回兩個輸出：低解析度 (256x256) 和高解析度 (512x512)
-        fake_b_L, fake_b_H = net_g(rgb)
-        
-        # 對高解析度輸出，需要上採樣目標圖像以匹配
-        tar_H = F.interpolate(tar, scale_factor=2, mode='bilinear', align_corners=False)
+        # Spectroformer (mymodel) 返回單一輸出
+        fake_b = net_g(rgb)
 
         ######################
         # 更新生成器
         ######################
         optimizer_g.zero_grad()
       
-        # 計算低解析度損失（參考 train.py 的方式）
-        loss_L_char = Charbonnier_loss(tar, fake_b_L)
-        loss_L_per = L_per(fake_b_L, tar)
-        loss_L_grad = Gradient_Loss(fake_b_L, tar)
-        loss_L_ssim = 1 - MS_SSIM_loss(fake_b_L, tar)
-        loss_g_L = Weighted_Loss4(loss_L_char, loss_L_per, loss_L_grad, loss_L_ssim)
-        
-        # 計算高解析度損失
-        loss_H_char = Charbonnier_loss(tar_H, fake_b_H)
-        loss_H_per = L_per(fake_b_H, tar_H)
-        loss_H_grad = Gradient_Loss(fake_b_H, tar_H)
-        loss_H_ssim = 1 - MS_SSIM_loss(fake_b_H, tar_H)
-        loss_g_H = Weighted_Loss4(loss_H_char, loss_H_per, loss_H_grad, loss_H_ssim)
-        
-        # 組合兩個損失（使用動態權重）
-        loss_g = Weighted_Loss2(loss_g_L, loss_g_H)
+        # 計算損失（使用4個損失組件的加權組合）
+        loss_char = Charbonnier_loss(tar, fake_b)
+        loss_per = L_per(fake_b, tar)
+        loss_grad = Gradient_Loss(fake_b, tar)
+        loss_ssim = 1 - MS_SSIM_loss(fake_b, tar)
+        loss_g = Weighted_Loss4(loss_char, loss_per, loss_grad, loss_ssim)
         
         # 檢查損失是否為nan或inf
         if torch.isnan(loss_g) or torch.isinf(loss_g):
             print(f"警告：在epoch {epoch}, iteration {iteration} 檢測到異常損失: {loss_g.item()}")
-            print(f"低解析度損失: {loss_g_L.item():.6f}")
-            print(f"高解析度損失: {loss_g_H.item():.6f}")
-            print(f"  - Charbonnier損失 (L): {loss_L_char.item():.6f}, (H): {loss_H_char.item():.6f}")
-            print(f"  - 感知損失 (L): {loss_L_per.item():.6f}, (H): {loss_H_per.item():.6f}")
-            print(f"  - 梯度損失 (L): {loss_L_grad.item():.6f}, (H): {loss_H_grad.item():.6f}")
-            print(f"  - MS-SSIM損失 (L): {loss_L_ssim.item():.6f}, (H): {loss_H_ssim.item():.6f}")
+            print(f"  - Charbonnier損失: {loss_char.item():.6f}")
+            print(f"  - 感知損失: {loss_per.item():.6f}")
+            print(f"  - 梯度損失: {loss_grad.item():.6f}")
+            print(f"  - MS-SSIM損失: {loss_ssim.item():.6f}")
             
             # 跳過這個batch的更新
             optimizer_g.zero_grad()
@@ -338,10 +342,10 @@ for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
         })
 
         if iteration % 20 == 0:
-            # 使用低解析度輸出進行可視化
-            out_image = torch.cat((rgb, fake_b_L, tar), 3)
+            # 輸出可視化
+            out_image = torch.cat((rgb, fake_b, tar), 3)
             out_image = out_image[0].detach().squeeze(0).cpu()
-            save_img(out_image, os.path.join(opt.output_dir, indx[0]))
+            save_img(out_image, os.path.join(train_output_dir, indx[0]))
         
         # # 清理不必要的變數以節省記憶體
         # del fake_b, loss_g
@@ -358,9 +362,7 @@ for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
 
     update_learning_rate(net_g_scheduler, optimizer_g)
   
-    # 測試
-    test_output_dir = os.path.join('./test/')
-    os.makedirs(test_output_dir, exist_ok=True)
+    # 測試（使用時間戳目錄，已在開頭創建）
 
     # 初始化總體指標
     total_psnr = 0
@@ -374,9 +376,8 @@ for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
     for test_iter, batch in enumerate(test_progress, 1):
         rgb_input, target, ind = batch[0].to(device), batch[1].to(device), batch[2]
         with torch.no_grad():
-            # Restormer 返回兩個輸出，使用低解析度輸出進行評估
-            prediction_L, prediction_H = net_g(rgb_input)
-            prediction = prediction_L  # 使用低解析度輸出與原始目標比較
+            # Spectroformer (mymodel) 返回單一輸出
+            prediction = net_g(rgb_input)
         
         out = torch.cat((prediction, target), 3)
         output_cat = out[0].detach().squeeze(0).cpu()
@@ -424,19 +425,23 @@ for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
         print(f"總測試影像數量: {total_images}")
         print("=" * 50)
 
-    # 儲存檢查點
-    if epoch % 1 == 0:
-        if not os.path.exists("checkpoint"):
-            os.mkdir("checkpoint")
-        if not os.path.exists(os.path.join("checkpoint", opt.dataset_path.split('/')[-1])):
-            os.mkdir(os.path.join("checkpoint", opt.dataset_path.split('/')[-1]))
-        net_g_model_out_path = "checkpoint/{}/netG_model_epoch_{}.pth".format(
-            opt.dataset_path.split('/')[-1], epoch + 1)
+    # 只保存最佳模型（根據 PSNR）
+    if total_images > 0 and avg_psnr > best_psnr:
+        best_psnr = avg_psnr
+        best_epoch = epoch
+        
+        # 刪除之前的最佳模型
+        best_model_path = os.path.join(checkpoint_dir, "best_model.pth")
+        
         # 如果使用 DataParallel，保存時需要使用 .module
         if isinstance(net_g, torch.nn.DataParallel):
-            torch.save(net_g.module.state_dict(), net_g_model_out_path)
+            torch.save(net_g.module.state_dict(), best_model_path)
         else:
-            torch.save(net_g.state_dict(), net_g_model_out_path)
-        print("Checkpoint saved to {}".format(net_g_model_out_path))
+            torch.save(net_g.state_dict(), best_model_path)
+        
+        print(f"🏆 新的最佳模型！PSNR: {best_psnr:.2f} dB (Epoch {best_epoch})")
+        print(f"模型已保存至: {best_model_path}")
+    else:
+        print(f"當前最佳: Epoch {best_epoch} with PSNR: {best_psnr:.2f} dB")
 
-print("訓練完成！")
+print(f"\n訓練完成！最佳模型: Epoch {best_epoch} with PSNR: {best_psnr:.2f} dB")
